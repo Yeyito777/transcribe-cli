@@ -6,8 +6,10 @@ const OPENAI_ORIGINATOR = "codex_cli_rs";
 const OPENAI_CODEX_CLIENT_VERSION = process.env.OPENAI_CODEX_CLIENT_VERSION?.trim() || "0.99.0";
 const CHATGPT_BASE_URL = (process.env.OPENAI_CHATGPT_BASE_URL?.trim() || "https://chatgpt.com").replace(/\/+$/, "");
 const OPENAI_TRANSCRIBE_URL = `${CHATGPT_BASE_URL}/backend-api/transcribe`;
+const OPENAI_RESPONSES_AUDIO_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_USER_AGENT = `${OPENAI_ORIGINATOR}/${OPENAI_CODEX_CLIENT_VERSION} (${platform()} ${release()}; ${arch()}) exocortex-transcribe-cli/openai`;
 const OPENAI_AUTH_ARG = "--exocortex-auth-openai";
+const DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const UNKNOWN_AUDIO_MIME_TYPE = "application/octet-stream";
 
 const AUDIO_MIME_BY_EXTENSION: Record<string, string> = {
@@ -42,12 +44,19 @@ interface OpenAITranscriptionSession {
   accountId: string | null;
 }
 
+interface OpenAIApiKeySession {
+  apiKey: string;
+  model: string;
+}
+
+type TranscriptionSession = OpenAITranscriptionSession | OpenAIApiKeySession;
+
 interface TranscriptionResponse {
   text?: unknown;
 }
 
 function usage(): string {
-  return `usage: transcribe [options] <audio-file>\n\noptions:\n  --mime-type <type>   Override inferred MIME type\n  --json               Print JSON instead of plain transcript text\n  -h, --help           Show this help\n\nThis tool expects daemon-provided OpenAI auth (${OPENAI_AUTH_ARG}).`;
+  return `usage: transcribe [options] <audio-file>\n\noptions:\n  --mime-type <type>   Override inferred MIME type\n  --json               Print JSON instead of plain transcript text\n  -h, --help           Show this help\n\nThis tool expects daemon-provided OpenAI auth (${OPENAI_AUTH_ARG}) or OPENAI_API_KEY.`;
 }
 
 function die(message: string, code = 1): never {
@@ -55,8 +64,12 @@ function die(message: string, code = 1): never {
   process.exit(code);
 }
 
-function decodeOpenAIAuth(encoded: string | undefined): OpenAITranscriptionSession {
-  if (!encoded) die(`missing ${OPENAI_AUTH_ARG}; run this tool through Exocortex so the daemon can lend OpenAI auth`);
+function decodeOpenAIAuth(encoded: string | undefined): TranscriptionSession {
+  if (!encoded) {
+    const apiKey = process.env.OPENAI_API_KEY?.trim();
+    if (apiKey) return { apiKey, model: process.env.OPENAI_TRANSCRIPTION_MODEL?.trim() || DEFAULT_OPENAI_TRANSCRIPTION_MODEL };
+    die(`missing ${OPENAI_AUTH_ARG}; run this tool through Exocortex so the daemon can lend OpenAI auth, or set OPENAI_API_KEY`);
+  }
   let parsed: OpenAIAuthPayload;
   try {
     parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as OpenAIAuthPayload;
@@ -117,14 +130,30 @@ function buildOpenAIHeaders(overrides: Record<string, string> = {}): Record<stri
   };
 }
 
+function isApiKeySession(session: TranscriptionSession): session is OpenAIApiKeySession {
+  return "apiKey" in session;
+}
+
 async function transcribeAudioWithSession(
-  session: OpenAITranscriptionSession,
+  session: TranscriptionSession,
   audioBytes: Uint8Array,
   mimeType: string,
   filename: string,
 ): Promise<string> {
   if (audioBytes.byteLength === 0) throw new Error("Audio file is empty");
 
+  if (isApiKeySession(session)) {
+    return transcribeAudioWithApiKey(session, audioBytes, mimeType, filename);
+  }
+  return transcribeAudioWithChatGPTSession(session, audioBytes, mimeType, filename);
+}
+
+async function transcribeAudioWithChatGPTSession(
+  session: OpenAITranscriptionSession,
+  audioBytes: Uint8Array,
+  mimeType: string,
+  filename: string,
+): Promise<string> {
   const form = new FormData();
   form.append("file", new Blob([Buffer.from(audioBytes)], { type: mimeType }), filename);
 
@@ -142,8 +171,36 @@ async function transcribeAudioWithSession(
     throw new Error(`OpenAI transcription failed (${res.status}): ${text.slice(0, 500)}`);
   }
 
-  const data = await res.json() as TranscriptionResponse;
-  const text = typeof data.text === "string" ? data.text.trim() : "";
+  return parseTranscriptionResponse(await res.json());
+}
+
+async function transcribeAudioWithApiKey(
+  session: OpenAIApiKeySession,
+  audioBytes: Uint8Array,
+  mimeType: string,
+  filename: string,
+): Promise<string> {
+  const form = new FormData();
+  form.append("file", new Blob([Buffer.from(audioBytes)], { type: mimeType }), filename);
+  form.append("model", session.model);
+
+  const res = await fetch(OPENAI_RESPONSES_AUDIO_TRANSCRIBE_URL, {
+    method: "POST",
+    headers: buildOpenAIHeaders({ Authorization: `Bearer ${session.apiKey}` }),
+    body: form,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`OpenAI API transcription failed (${res.status}): ${text.slice(0, 500)}`);
+  }
+
+  return parseTranscriptionResponse(await res.json());
+}
+
+function parseTranscriptionResponse(data: unknown): string {
+  const response = data as TranscriptionResponse;
+  const text = typeof response.text === "string" ? response.text.trim() : "";
   if (!text) throw new Error("OpenAI transcription returned an empty result");
   return text;
 }
