@@ -9,4 +9,7 @@ transcribe audio.wav
 transcribe audio.wav --mime-type audio/wav
 ```
 
-The tool expects Exocortex daemon-provided OpenAI auth via `--exocortex-auth-openai` and is normally invoked from inside Exocortex.
+exocortexd transcribes the audio with its own OpenAI login: the tool sends the
+file over the daemon socket (`EXOCORTEX_SOCKET`, else the checkout's
+`config/runtime/exocortexd.sock`) and prints the text. It never sees a
+credential, and it works from any shell, including Claude Code's.

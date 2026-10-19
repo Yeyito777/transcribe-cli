@@ -5,8 +5,5 @@
   "display": {
     "label": "Transcribe",
     "color": "#f2fa9c"
-  },
-  "auth": {
-    "providers": ["openai"]
   }
 }
